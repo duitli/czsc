@@ -946,3 +946,61 @@ pub fn zdy_dif_v230528(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> Vec
     }
     make_kline_signal_v1(&k1, &k2, k3, "其他")
 }
+
+/// try_custom_V260611：最近 5 根 K 线极值买卖点信号
+///
+/// 参数模板：`"{freq}_D{di}N{n}_tryCustomV260611"`
+///
+/// 信号逻辑：
+/// 1. 取倒数第 `di` 根开始的最近 `n` 根 K 线，默认 `di=1`、`n=5`；
+/// 2. 若最后一根的最低值等于这 `n` 根里的最低值，则判定为 `买点`；
+/// 3. 否则若最后一根的最高值等于这 `n` 根里的最高值，则判定为 `卖点`；
+/// 4. 其他情况返回 `其他`。
+///
+/// 信号列表示例：
+/// - `Signal('30分钟_D1N5_tryCustomV260611_买点_任意_任意_0')`
+/// - `Signal('30分钟_D1N5_tryCustomV260611_卖点_任意_任意_0')`
+///
+/// 参数说明：
+/// - `di`：信号计算截止在倒数第 `di` 根K线，默认 `1`；
+/// - `n`：比较窗口长度，默认 `5`。
+#[signal(
+    category = "kline",
+    name = "try_custom_V260611",
+    template = "{freq}_D{di}N{n}_tryCustomV260611",
+    opcode = "TryCustomV260611",
+    param_kind = "TryCustomV260611"
+)]
+pub fn try_custom_v260611(c: &CZSC, params: &ParamView, _cache: &mut TaCache) -> Vec<Signal> {
+    let di = get_usize_param(params, "di", 1);
+    let n = get_usize_param(params, "n", 5);
+
+    let k1 = c.freq.to_string();
+    let k2 = format!("D{}N{}", di, n);
+    let k3 = "tryCustomV260611";
+
+    let bars = get_sub_elements(&c.bars_raw, di, n);
+    if bars.len() < n {
+        return make_kline_signal_v1(&k1, &k2, k3, "其他");
+    }
+
+    let last = bars.last().unwrap();
+    let min_low = bars
+        .iter()
+        .map(|x| x.low)
+        .fold(f64::INFINITY, f64::min);
+    let max_high = bars
+        .iter()
+        .map(|x| x.high)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let v1 = if last.low <= min_low {
+        "买点"
+    } else if last.high >= max_high {
+        "卖点"
+    } else {
+        "其他"
+    };
+
+    make_kline_signal_v1(&k1, &k2, k3, v1)
+}

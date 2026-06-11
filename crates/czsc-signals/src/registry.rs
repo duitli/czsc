@@ -494,7 +494,11 @@ mod tests {
     fn test_generated_descriptor_list_contains_unmigrated_baselines() {
         let generated = super::list_generated_signal_descriptors();
         let names: std::collections::HashSet<_> = generated.iter().map(|d| d.name).collect();
-        for name in ["tas_rsi_base_V230227", "pos_ma_V230414"] {
+        for name in [
+            "tas_rsi_base_V230227",
+            "pos_ma_V230414",
+            "try_custom_V260611",
+        ] {
             assert!(names.contains(name), "missing generated descriptor: {name}");
         }
     }
