@@ -57,6 +57,24 @@ impl<'a> ParamView<'a> {
     }
 
     #[inline]
+    pub fn f64(&self, key: &str, default: f64) -> f64 {
+        if let Some(val) = self.inner.get(key) {
+            if let Some(n) = val.as_f64()
+                && n.is_finite()
+            {
+                return n;
+            }
+            if let Some(s) = val.as_str()
+                && let Ok(n) = s.parse::<f64>()
+                && n.is_finite()
+            {
+                return n;
+            }
+        }
+        default
+    }
+
+    #[inline]
     pub fn value(&self, key: &str) -> Option<&Value> {
         self.inner.get(key)
     }
