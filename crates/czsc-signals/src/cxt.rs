@@ -1793,6 +1793,32 @@ fn strict_bs_bi_macd_power(
     Some(StrictMacdPower { area, peak, diff })
 }
 
+fn strict_bs_bi_macd_abs_area(
+    bi: &BI,
+    macd: &MacdSeries,
+    id_to_idx: &HashMap<i32, usize>,
+) -> Option<f64> {
+    let bars = strict_bs_bi_raw_bars(bi);
+    if bars.is_empty() {
+        return None;
+    }
+
+    let mut area = 0.0;
+    let mut count = 0usize;
+    for bar in bars {
+        let idx = *id_to_idx.get(&bar.id)?;
+        let m = *macd.macd.get(idx)?;
+        if m.is_finite() {
+            area += m.abs();
+            count += 1;
+        }
+    }
+    if count == 0 || !area.is_finite() {
+        return None;
+    }
+    Some(area)
+}
+
 fn strict_bs_power_value(
     bi: &BI,
     macd: &MacdSeries,
@@ -1911,53 +1937,6 @@ fn strict_bs_find_adjacent_center_before_with_max(
         }
     }
     None
-}
-
-fn strict_bs_has_center_leave_setup(
-    bis: &[BI],
-    leave_idx: usize,
-    max_center_n: usize,
-    buffer_bp: f64,
-) -> bool {
-    if leave_idx < 3 || leave_idx >= bis.len() {
-        return false;
-    }
-    let Some(center) = strict_bs_find_adjacent_center_before_with_max(bis, leave_idx, max_center_n)
-    else {
-        return false;
-    };
-    let leave = &bis[leave_idx];
-    match strict_bs_side_from_direction(leave.direction) {
-        StrictBsSide::Buy => {
-            leave.direction == Direction::Down
-                && leave.get_low() < strict_bs_boundary_low(center.zd, buffer_bp)
-        }
-        StrictBsSide::Sell => {
-            leave.direction == Direction::Up
-                && leave.get_high() > strict_bs_boundary_high(center.zg, buffer_bp)
-        }
-    }
-}
-
-fn strict_bs_current_has_center_leave_setup(
-    all_bis: &[BI],
-    params: &StrictBsParams,
-    max_n: usize,
-) -> bool {
-    let mut n = max_n.clamp(5, params.n);
-    if n % 2 == 0 {
-        n -= 1;
-    }
-    while n >= 5 {
-        let bis = get_sub_elements(all_bis, params.di, n);
-        if bis.len() == n
-            && strict_bs_has_center_leave_setup(&bis, bis.len() - 1, params.center_n, params.buffer_bp)
-        {
-            return true;
-        }
-        n -= 2;
-    }
-    false
 }
 
 fn strict_bs_find_center_after_with_max(
@@ -2173,8 +2152,8 @@ fn strict_bs_find_panbei_divergence(
                 n -= 2;
                 continue;
             }
-            let current_power = strict_bs_power_value(last, macd, id_to_idx, params.macd_metric)?;
-            let reference_power = strict_bs_power_value(first, macd, id_to_idx, params.macd_metric)?;
+            let current_power = strict_bs_bi_macd_abs_area(last, macd, id_to_idx)?;
+            let reference_power = strict_bs_bi_macd_abs_area(first, macd, id_to_idx)?;
             if strict_bs_has_divergence(
                 current_power,
                 reference_power,
@@ -2205,9 +2184,6 @@ fn strict_bs_detect_bs1_anchor_v260617(
 ) -> Option<StrictBs1Anchor> {
     if let Some(anchor) = strict_bs_find_center_divergence(&c.bi_list, macd, id_to_idx, params, max_n) {
         return Some(anchor);
-    }
-    if strict_bs_current_has_center_leave_setup(&c.bi_list, params, max_n) {
-        return None;
     }
     if strict_bs1_allows_panbei(params.bs1_divergence_kind) {
         if let Some(anchor) = strict_bs_find_panbei_divergence(&c.bi_list, macd, id_to_idx, params, max_n) {
@@ -2282,7 +2258,11 @@ fn strict_bs_find_recent_bs1_anchor_before_v260617(
     side: StrictBsSide,
     before_idx: usize,
 ) -> Option<StrictBs1Anchor> {
-    let mut n = params.n.clamp(5, before_idx + 1);
+    let upper = params.n.min(before_idx + 1);
+    if upper < 5 {
+        return None;
+    }
+    let mut n = upper;
     if n % 2 == 0 {
         n -= 1;
     }
