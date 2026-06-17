@@ -1664,6 +1664,7 @@ struct StrictBsParams<'a> {
     macd_metric: &'a str,
     bs1_divergence_kind: &'a str,
     bs2_divergence_mode: &'a str,
+    bs3_divergence_mode: &'a str,
     macd_ratio: f64,
     macd_abs_min: f64,
     buffer_bp: f64,
@@ -1689,6 +1690,7 @@ impl<'a> StrictBsParams<'a> {
             macd_metric: params.str("macd_metric", "area"),
             bs1_divergence_kind: params.str("bs1_divergence_kind", "all"),
             bs2_divergence_mode: params.str("bs2_divergence_mode", "optional"),
+            bs3_divergence_mode: params.str("bs3_divergence_mode", "optional"),
             macd_ratio: params.f64("macd_ratio", 0.85),
             macd_abs_min: params.f64("macd_abs_min", 0.0),
             buffer_bp: params.f64("buffer_bp", 0.0),
@@ -1714,8 +1716,8 @@ impl<'a> StrictBsParams<'a> {
 
     fn k2_bs3_v260617(&self) -> String {
         format!(
-            "D{}N{}U{}#{}",
-            self.di, self.n, self.min_ubi_bars, self.max_ubi_bars
+            "D{}N{}DVG{}U{}#{}",
+            self.di, self.n, self.bs3_divergence_mode, self.min_ubi_bars, self.max_ubi_bars
         )
     }
 
@@ -1744,7 +1746,7 @@ fn strict_bs_has_divergence(current: f64, reference: f64, ratio: f64, abs_min: f
         && current < reference * ratio
 }
 
-fn strict_bs2_requires_divergence(mode: &str) -> bool {
+fn strict_bs_requires_divergence(mode: &str) -> bool {
     matches!(mode, "required" | "strict" | "必须" | "必选")
 }
 
@@ -2453,7 +2455,7 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "结构不符");
     };
 
-    let divergence_required = strict_bs2_requires_divergence(p.bs2_divergence_mode);
+    let divergence_required = strict_bs_requires_divergence(p.bs2_divergence_mode);
     let diverged = match (
         strict_bs_power_value(retest, macd, &id_to_idx, p.macd_metric),
         strict_bs_power_value(anchor_bi, macd, &id_to_idx, p.macd_metric),
@@ -2573,7 +2575,7 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
 #[signal(
     category = "kline",
     name = "cxt_bs3_yi_V260617",
-    template = "{freq}_D{di}N{n}U{min_ubi_bars}#{max_ubi_bars}_BS3YIV260617",
+    template = "{freq}_D{di}N{n}DVG{bs3_divergence_mode}U{min_ubi_bars}#{max_ubi_bars}_BS3YIV260617",
     opcode = "CxtBs3YiV260617",
     param_kind = "CxtBs3YiV260617"
 )]
@@ -2604,15 +2606,19 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let center = segment.center;
     let leave = &bis[segment.leave_idx];
     let pullback = &bis[segment.pullback_idx()];
-    let Some(leave_power) = strict_bs_power_value(leave, macd, &id_to_idx, p.macd_metric) else {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
-    };
-    let Some(pullback_power) = strict_bs_power_value(pullback, macd, &id_to_idx, p.macd_metric)
-    else {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
-    };
-    if !strict_bs_has_divergence(pullback_power, leave_power, p.macd_ratio, p.macd_abs_min) {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
+    if strict_bs_requires_divergence(p.bs3_divergence_mode) {
+        let Some(leave_power) = strict_bs_power_value(leave, macd, &id_to_idx, p.macd_metric)
+        else {
+            return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
+        };
+        let Some(pullback_power) =
+            strict_bs_power_value(pullback, macd, &id_to_idx, p.macd_metric)
+        else {
+            return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
+        };
+        if !strict_bs_has_divergence(pullback_power, leave_power, p.macd_ratio, p.macd_abs_min) {
+            return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
+        }
     }
 
     if leave.direction == Direction::Up
