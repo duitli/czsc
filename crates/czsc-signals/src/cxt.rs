@@ -2195,11 +2195,17 @@ fn strict_bs_detect_bs1_anchor_v260617(
     max_n: usize,
 ) -> Option<StrictBs1Anchor> {
     if let Some(anchor) = strict_bs_find_center_divergence(&c.bi_list, macd, id_to_idx, params, max_n) {
-        return Some(anchor);
+        let bis = get_sub_elements(&c.bi_list, params.di, anchor.bi_count);
+        if bis.len() == anchor.bi_count && strict_bs_is_trend_window(bis, anchor.side) {
+            return Some(anchor);
+        }
     }
     if strict_bs1_allows_panbei(params.bs1_divergence_kind) {
         if let Some(anchor) = strict_bs_find_panbei_divergence(&c.bi_list, macd, id_to_idx, params, max_n) {
-            return Some(anchor);
+            let bis = get_sub_elements(&c.bi_list, params.di, anchor.bi_count);
+            if bis.len() == anchor.bi_count && strict_bs_is_panbei_trend_window(bis, anchor.side) {
+                return Some(anchor);
+            }
         }
     }
     None
