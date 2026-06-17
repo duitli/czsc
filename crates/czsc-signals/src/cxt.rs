@@ -1669,6 +1669,7 @@ struct StrictBsParams<'a> {
     macd_abs_min: f64,
     buffer_bp: f64,
     center_n: usize,
+    bs2_like_anchor_n: usize,
     min_ubi_bars: usize,
     max_ubi_bars: usize,
 }
@@ -1695,6 +1696,7 @@ impl<'a> StrictBsParams<'a> {
             macd_abs_min: params.f64("macd_abs_min", 0.0),
             buffer_bp: params.f64("buffer_bp", 0.0),
             center_n: get_usize_param(params, "center_n", n).clamp(3, 31),
+            bs2_like_anchor_n: get_usize_param(params, "bs2_like_anchor_n", n * 5).clamp(5, 99),
             min_ubi_bars,
             max_ubi_bars,
         }
@@ -1948,31 +1950,6 @@ fn strict_bs_find_recent_segment_before_pullback(
     }
     let leave_idx = pullback_idx - 1;
     strict_bs_find_adjacent_segment_before_leave(bis, leave_idx, max_center_n)
-}
-
-fn strict_bs_find_center_after_with_max(
-    bis: &[BI],
-    start_inclusive: usize,
-    end_exclusive: usize,
-    max_center_n: usize,
-) -> Option<StrictChanCenter> {
-    if end_exclusive < start_inclusive + 3 || end_exclusive > bis.len() {
-        return None;
-    }
-    let max_len = max_center_n.clamp(3, end_exclusive - start_inclusive);
-    for end in (start_inclusive + 2..end_exclusive).rev() {
-        let longest = max_len.min(end + 1 - start_inclusive);
-        for len in (3..=longest).rev() {
-            let start = end + 1 - len;
-            if start < start_inclusive {
-                continue;
-            }
-            if let Some(center) = strict_bs_center_from_slice(&bis[start..=end]) {
-                return Some(center);
-            }
-        }
-    }
-    None
 }
 
 fn strict_bs_is_trend_window(bis: &[BI], side: StrictBsSide) -> bool {
@@ -2369,39 +2346,108 @@ fn strict_bs_anchor_is_unbroken(
     }
 }
 
-fn strict_bs_has_prior_standard_bs2(
+fn strict_bs_find_prior_standard_bs2_idx(
     bis: &[BI],
     anchor: StrictBs1Anchor,
     retest_idx: usize,
     buffer_bp: f64,
-) -> bool {
+) -> Option<usize> {
     if retest_idx <= anchor.index + 2 {
-        return false;
+        return None;
     }
     match anchor.side {
         StrictBsSide::Buy => {
-            for idx in anchor.index + 2..retest_idx {
+            for idx in (anchor.index + 2..retest_idx).rev() {
                 if bis[idx - 1].direction == Direction::Up
                     && bis[idx].direction == Direction::Down
                     && bis[idx].get_low() >= strict_bs_boundary_low(anchor.low, buffer_bp)
                 {
-                    return true;
+                    return Some(idx);
                 }
             }
-            false
+            None
         }
         StrictBsSide::Sell => {
-            for idx in anchor.index + 2..retest_idx {
+            for idx in (anchor.index + 2..retest_idx).rev() {
                 if bis[idx - 1].direction == Direction::Down
                     && bis[idx].direction == Direction::Up
                     && bis[idx].get_high() <= strict_bs_boundary_high(anchor.high, buffer_bp)
                 {
-                    return true;
+                    return Some(idx);
                 }
             }
-            false
+            None
         }
     }
+}
+
+fn strict_bs_bi_retests_center(
+    bi: &BI,
+    side: StrictBsSide,
+    center: StrictChanCenter,
+    buffer_bp: f64,
+) -> bool {
+    match side {
+        StrictBsSide::Buy => {
+            bi.direction == Direction::Down
+                && bi.get_low() >= strict_bs_boundary_low(center.zd, buffer_bp)
+                && bi.get_low() <= strict_bs_boundary_high(center.zg, buffer_bp)
+        }
+        StrictBsSide::Sell => {
+            bi.direction == Direction::Up
+                && bi.get_high() <= strict_bs_boundary_high(center.zg, buffer_bp)
+                && bi.get_high() >= strict_bs_boundary_low(center.zd, buffer_bp)
+        }
+    }
+}
+
+fn strict_bs_has_third_bs_between(
+    bis: &[BI],
+    side: StrictBsSide,
+    start_idx: usize,
+    end_idx: usize,
+    max_center_n: usize,
+) -> bool {
+    if end_idx <= start_idx + 1 || end_idx > bis.len() {
+        return false;
+    }
+    for pullback_idx in start_idx + 1..end_idx {
+        let Some(segment) = strict_bs_find_recent_segment_before_pullback(
+            &bis[..=pullback_idx],
+            pullback_idx,
+            max_center_n,
+        ) else {
+            continue;
+        };
+        if segment.pullback_idx() != pullback_idx {
+            continue;
+        }
+        let center = segment.center;
+        let leave = &bis[segment.leave_idx];
+        let pullback = &bis[pullback_idx];
+        match side {
+            StrictBsSide::Buy
+                if leave.direction == Direction::Up
+                    && leave.get_high() > center.zg
+                    && pullback.direction == Direction::Down
+                    && pullback.get_low() > center.zg
+                    && strict_bs_is_bottom_confirmed(bis, pullback_idx) =>
+            {
+                return true;
+            }
+            StrictBsSide::Sell
+                if leave.direction == Direction::Down
+                    && leave.get_low() < center.zd
+                    && pullback.direction == Direction::Up
+                    && pullback.get_high() < center.zd
+                    && strict_bs_is_top_confirmed(bis, pullback_idx) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// cxt_bs2_yi_V260617：结构增强版二类 / 类二类买卖点
@@ -2493,11 +2539,10 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         }
     }
 
-    let anchor_before = (retest_idx.saturating_sub(2)..retest_idx)
-        .rev()
-        .find_map(|idx| {
-            strict_bs_find_recent_bs1_anchor_before_v260617(c, &p, macd, &id_to_idx, side, idx)
-        });
+    let like_anchor_start = retest_idx.saturating_sub(p.bs2_like_anchor_n);
+    let anchor_before = (like_anchor_start..retest_idx).rev().find_map(|idx| {
+        strict_bs_find_recent_bs1_anchor_before_v260617(c, &p, macd, &id_to_idx, side, idx)
+    });
     let Some(anchor) = anchor_before else {
         return match side {
             StrictBsSide::Buy => make_kline_signal_v3(
@@ -2521,22 +2566,37 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     if !strict_bs_anchor_is_unbroken(&c.bi_list, anchor, retest_idx, p.buffer_bp) {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "前置失效", "破位");
     }
-    if !strict_bs_has_prior_standard_bs2(&c.bi_list, anchor, retest_idx, p.buffer_bp) {
+    let Some(prior_bs2_idx) =
+        strict_bs_find_prior_standard_bs2_idx(&c.bi_list, anchor, retest_idx, p.buffer_bp)
+    else {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "非首次回试", "未成类二");
+    };
+    if strict_bs_has_third_bs_between(
+        &c.bi_list,
+        side,
+        prior_bs2_idx,
+        retest_idx,
+        p.center_n,
+    ) {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "中枢上移", "未成类二");
     }
 
-    let Some(center) = strict_bs_find_center_after_with_max(
-        &c.bi_list,
-        anchor.index + 1,
-        retest_idx + 1,
-        p.center_n,
-    ) else {
+    let Some(segment) =
+        strict_bs_find_recent_segment_before_pullback(&c.bi_list[..=retest_idx], retest_idx, p.center_n)
+    else {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "无中枢", "未成类二");
     };
+    debug_assert_eq!(segment.center_end + 1, segment.leave_idx);
+    debug_assert_eq!(segment.leave_idx + 1, retest_idx);
+    let center = segment.center;
+    let prior_retests_same_center =
+        strict_bs_bi_retests_center(&c.bi_list[prior_bs2_idx], side, center, p.buffer_bp);
+    let current_retests_center = strict_bs_bi_retests_center(retest, side, center, p.buffer_bp);
     match side {
         StrictBsSide::Buy => {
             if retest.get_low() >= strict_bs_boundary_low(anchor.low, p.buffer_bp)
-                && retest.get_low() >= strict_bs_boundary_low(center.zd, p.buffer_bp)
+                && current_retests_center
+                && prior_retests_same_center
                 && retest.get_high() <= center.gg
             {
                 make_kline_signal_v3(
@@ -2547,13 +2607,18 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
                     "有一买前置",
                     lifecycle_status,
                 )
+            } else if retest.get_low() > strict_bs_boundary_high(center.zg, p.buffer_bp)
+                || !prior_retests_same_center
+            {
+                make_kline_signal_v3(&k1, &k2, k3, "其他", "中枢上移", "未成类二")
             } else {
                 make_kline_signal_v3(&k1, &k2, k3, "其他", "回试破位", "未成类二")
             }
         }
         StrictBsSide::Sell => {
             if retest.get_high() <= strict_bs_boundary_high(anchor.high, p.buffer_bp)
-                && retest.get_high() <= strict_bs_boundary_high(center.zg, p.buffer_bp)
+                && current_retests_center
+                && prior_retests_same_center
                 && retest.get_low() >= center.dd
             {
                 make_kline_signal_v3(
@@ -2564,6 +2629,10 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
                     "有一卖前置",
                     lifecycle_status,
                 )
+            } else if retest.get_high() < strict_bs_boundary_low(center.zd, p.buffer_bp)
+                || !prior_retests_same_center
+            {
+                make_kline_signal_v3(&k1, &k2, k3, "其他", "中枢上移", "未成类二")
             } else {
                 make_kline_signal_v3(&k1, &k2, k3, "其他", "反抽破位", "未成类二")
             }
