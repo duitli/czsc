@@ -1627,8 +1627,21 @@ struct StrictChanCenter {
     zd: f64,
     gg: f64,
     dd: f64,
-    start: usize,
-    end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StrictChanSegment {
+    enter_idx: usize,
+    center_start: usize,
+    center_end: usize,
+    leave_idx: usize,
+    center: StrictChanCenter,
+}
+
+impl StrictChanSegment {
+    fn pullback_idx(&self) -> usize {
+        self.leave_idx + 1
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1878,7 +1891,7 @@ fn strict_bs_is_top_confirmed(bis: &[BI], idx: usize) -> bool {
             || bi.fx_b.mark == Mark::G)
 }
 
-fn strict_bs_center_from_slice(bis: &[BI], _start: usize) -> Option<StrictChanCenter> {
+fn strict_bs_center_from_slice(bis: &[BI]) -> Option<StrictChanCenter> {
     if bis.len() < 3 {
         return None;
     }
@@ -1891,52 +1904,48 @@ fn strict_bs_center_from_slice(bis: &[BI], _start: usize) -> Option<StrictChanCe
         zd: zs.zd,
         gg: zs.gg,
         dd: zs.dd,
-        start: _start,
-        end: _start + bis.len() - 1,
     })
 }
 
-fn strict_bs_find_last_center_before_with_max(
+fn strict_bs_find_adjacent_segment_before_leave(
     bis: &[BI],
-    end_exclusive: usize,
+    leave_idx: usize,
     max_center_n: usize,
-) -> Option<StrictChanCenter> {
-    if end_exclusive < 3 {
+) -> Option<StrictChanSegment> {
+    if leave_idx < 4 || leave_idx >= bis.len() {
         return None;
     }
-    let max_len = max_center_n.clamp(3, end_exclusive);
-    for end in (2..end_exclusive).rev() {
-        let longest = max_len.min(end + 1);
-        for len in (3..=longest).rev() {
-            let start = end + 1 - len;
-            if let Some(center) = strict_bs_center_from_slice(&bis[start..=end], start) {
-                return Some(center);
-            }
+    let center_end = leave_idx - 1;
+    let max_len = max_center_n.min(center_end + 1);
+    for len in (3..=max_len).rev() {
+        let center_start = center_end + 1 - len;
+        if center_start == 0 {
+            continue;
         }
+        let Some(center) = strict_bs_center_from_slice(&bis[center_start..=center_end]) else {
+            continue;
+        };
+        return Some(StrictChanSegment {
+            enter_idx: center_start - 1,
+            center_start,
+            center_end,
+            leave_idx,
+            center,
+        });
     }
     None
 }
 
-fn strict_bs_find_adjacent_center_before_with_max(
+fn strict_bs_find_recent_segment_before_pullback(
     bis: &[BI],
-    leave_idx: usize,
+    pullback_idx: usize,
     max_center_n: usize,
-) -> Option<StrictChanCenter> {
-    if leave_idx < 3 || leave_idx >= bis.len() {
+) -> Option<StrictChanSegment> {
+    if pullback_idx < 5 || pullback_idx >= bis.len() {
         return None;
     }
-    let end = leave_idx - 1;
-    let max_len = max_center_n.clamp(3, end + 1);
-    for len in (3..=max_len).rev() {
-        let start = end + 1 - len;
-        if start == 0 {
-            continue;
-        }
-        if let Some(center) = strict_bs_center_from_slice(&bis[start..=end], start) {
-            return Some(center);
-        }
-    }
-    None
+    let leave_idx = pullback_idx - 1;
+    strict_bs_find_adjacent_segment_before_leave(bis, leave_idx, max_center_n)
 }
 
 fn strict_bs_find_center_after_with_max(
@@ -1956,7 +1965,7 @@ fn strict_bs_find_center_after_with_max(
             if start < start_inclusive {
                 continue;
             }
-            if let Some(center) = strict_bs_center_from_slice(&bis[start..=end], start) {
+            if let Some(center) = strict_bs_center_from_slice(&bis[start..=end]) {
                 return Some(center);
             }
         }
@@ -2048,13 +2057,16 @@ fn strict_bs_find_center_divergence(
         if bis.len() == n {
             let last = bis.last()?;
             let side = strict_bs_side_from_direction(last.direction);
-            let Some(center) =
-                strict_bs_find_adjacent_center_before_with_max(&bis, bis.len() - 1, params.center_n)
+            let Some(segment) =
+                strict_bs_find_adjacent_segment_before_leave(&bis, bis.len() - 1, params.center_n)
             else {
                 n -= 2;
                 continue;
             };
-            let enter = bis.get(center.start - 1)?;
+            debug_assert_eq!(segment.enter_idx + 1, segment.center_start);
+            debug_assert_eq!(segment.center_end + 1, segment.leave_idx);
+            let center = segment.center;
+            let enter = bis.get(segment.enter_idx)?;
             if enter.direction != last.direction {
                 n -= 2;
                 continue;
@@ -2574,15 +2586,18 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     if bis.len() < 5 {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "结构不足", "中枢序列");
     }
-    let Some(center) = strict_bs_find_last_center_before_with_max(&bis, bis.len() - 2, p.center_n) else {
+    let Some(segment) = strict_bs_find_recent_segment_before_pullback(&bis, bis.len() - 1, p.center_n) else {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "无中枢", "中枢序列");
     };
-    if center.end + 2 != bis.len() - 1 {
+    debug_assert_eq!(segment.enter_idx + 1, segment.center_start);
+    debug_assert_eq!(segment.center_end + 1, segment.leave_idx);
+    if segment.pullback_idx() != bis.len() - 1 {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "回中枢", "中枢序列");
     }
 
-    let leave = &bis[center.end + 1];
-    let pullback = &bis[center.end + 2];
+    let center = segment.center;
+    let leave = &bis[segment.leave_idx];
+    let pullback = &bis[segment.pullback_idx()];
     let Some(leave_power) = strict_bs_power_value(leave, macd, &id_to_idx, p.macd_metric) else {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
     };
@@ -2598,7 +2613,7 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         && leave.get_high() > center.zg
         && pullback.direction == Direction::Down
         && pullback.get_low() > center.zg
-        && strict_bs_is_bottom_confirmed(&bis, center.end + 2)
+        && strict_bs_is_bottom_confirmed(&bis, segment.pullback_idx())
     {
         let lifecycle_status =
             strict_bs_lifecycle_status(c, pullback, p.min_ubi_bars, p.max_ubi_bars);
@@ -2608,7 +2623,7 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         && leave.get_low() < center.zd
         && pullback.direction == Direction::Up
         && pullback.get_high() < center.zd
-        && strict_bs_is_top_confirmed(&bis, center.end + 2)
+        && strict_bs_is_top_confirmed(&bis, segment.pullback_idx())
     {
         let lifecycle_status =
             strict_bs_lifecycle_status(c, pullback, p.min_ubi_bars, p.max_ubi_bars);
