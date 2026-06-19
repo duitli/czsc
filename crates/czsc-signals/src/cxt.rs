@@ -21,7 +21,6 @@ use czsc_core::objects::direction::Direction;
 use czsc_core::objects::fx::FX;
 use czsc_core::objects::mark::Mark;
 use czsc_core::objects::signal::Signal;
-use czsc_core::objects::zs::ZS;
 use std::collections::HashMap;
 
 /// cxt_bi_base_V230228：笔基础状态信号
@@ -1644,6 +1643,15 @@ impl StrictChanSegment {
     }
 }
 
+/// 前向构造出的一个中枢：起止笔下标（含）+ 区间。
+/// 前向语义：起点固定，前 3 笔锁定 zd/zg，向后延伸到最长有效窗口。
+#[derive(Clone, Copy, Debug)]
+struct StrictForwardCenter {
+    start_idx: usize,
+    end_idx: usize,
+    center: StrictChanCenter,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct StrictBs1Anchor {
     side: StrictBsSide,
@@ -1895,22 +1903,86 @@ fn strict_bs_is_top_confirmed(bis: &[BI], idx: usize) -> bool {
             || bi.fx_b.mark == Mark::G)
 }
 
-fn strict_bs_center_from_slice(bis: &[BI]) -> Option<StrictChanCenter> {
+/// 计算一段笔的中枢边界与有效性，逻辑与 `ZS::new` + `ZS::is_valid` 完全一致，
+/// 但不克隆 `Vec<BI>`，直接从 high/low 计算，供前向构造在热路径上零分配复用。
+fn strict_bs_center_bounds(bis: &[BI]) -> Option<StrictChanCenter> {
     if bis.len() < 3 {
         return None;
     }
-    let zs = ZS::new(bis.to_vec());
-    if !zs.is_valid() {
+    let zg = bis
+        .iter()
+        .take(3)
+        .map(|x| x.get_high())
+        .fold(f64::INFINITY, f64::min);
+    let zd = bis
+        .iter()
+        .take(3)
+        .map(|x| x.get_low())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !zg.is_finite() || !zd.is_finite() || zg < zd {
         return None;
     }
-    Some(StrictChanCenter {
-        zg: zs.zg,
-        zd: zs.zd,
-        gg: zs.gg,
-        dd: zs.dd,
-    })
+    let gg = bis
+        .iter()
+        .map(|x| x.get_high())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let dd = bis
+        .iter()
+        .map(|x| x.get_low())
+        .fold(f64::INFINITY, f64::min);
+    let all_overlap = bis.iter().all(|bi| {
+        let high = bi.get_high();
+        let low = bi.get_low();
+        (high <= zg && high >= zd) || (low <= zg && low >= zd) || (high >= zg && low <= zd)
+    });
+    if !all_overlap {
+        return None;
+    }
+    Some(StrictChanCenter { zg, zd, gg, dd })
 }
 
+/// 前向贪心构造中枢序列：从最早一笔起，固定起点用前 3 笔锁定 zd/zg，向后延伸到
+/// 最长仍有效的窗口，封闭后跳到该中枢之后继续。产出不重叠的中枢序列，
+/// 与可视化 `engine._build_zs_overlays` 同一套规则（缠论"前三段定区间 + 延伸"）。
+/// 关键性质：已封闭中枢只取决于其自身区间内的笔，后续新笔不会回头改写它（不重绘）。
+fn strict_bs_build_forward_centers(bis: &[BI], max_center_n: usize) -> Vec<StrictForwardCenter> {
+    let mut out: Vec<StrictForwardCenter> = Vec::new();
+    let n = bis.len();
+    let cap = max_center_n.max(3);
+    let mut i = 0usize;
+    while i + 3 <= n {
+        let max_end = (i + cap).min(n);
+        let mut best: Option<(usize, StrictChanCenter)> = None;
+        let mut end = i + 3;
+        while end <= max_end {
+            match strict_bs_center_bounds(&bis[i..end]) {
+                Some(center) => best = Some((end, center)),
+                None => {
+                    if best.is_some() {
+                        break;
+                    }
+                }
+            }
+            end += 1;
+        }
+        if let Some((best_end, center)) = best {
+            out.push(StrictForwardCenter {
+                start_idx: i,
+                end_idx: best_end - 1,
+                center,
+            });
+            i = best_end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 取"离开笔之前最近的那个中枢"：在 `bis[..leave_idx]` 上前向构造中枢序列，
+/// 选取最后一个、且其末笔紧邻 `leave_idx`（中枢之后直接就是离开笔）的中枢。
+/// 这是"前向构造 + 后向选取"的落地：构造方向前向（稳定、不重绘、不过度合并），
+/// 但参照哪个中枢由当前离开笔往回选最近的一个。
 fn strict_bs_find_adjacent_segment_before_leave(
     bis: &[BI],
     leave_idx: usize,
@@ -1919,25 +1991,19 @@ fn strict_bs_find_adjacent_segment_before_leave(
     if leave_idx < 4 || leave_idx >= bis.len() {
         return None;
     }
-    let center_end = leave_idx - 1;
-    let max_len = max_center_n.min(center_end + 1);
-    for len in (3..=max_len).rev() {
-        let center_start = center_end + 1 - len;
-        if center_start == 0 {
-            continue;
-        }
-        let Some(center) = strict_bs_center_from_slice(&bis[center_start..=center_end]) else {
-            continue;
-        };
-        return Some(StrictChanSegment {
-            enter_idx: center_start - 1,
-            center_start,
-            center_end,
-            leave_idx,
-            center,
-        });
+    let centers = strict_bs_build_forward_centers(&bis[..leave_idx], max_center_n);
+    let last = centers.last()?;
+    // 中枢末笔必须紧邻离开笔（中间没有连接段），且中枢前要有一笔进入段。
+    if last.end_idx + 1 != leave_idx || last.start_idx == 0 {
+        return None;
     }
-    None
+    Some(StrictChanSegment {
+        enter_idx: last.start_idx - 1,
+        center_start: last.start_idx,
+        center_end: last.end_idx,
+        leave_idx,
+        center: last.center,
+    })
 }
 
 fn strict_bs_find_recent_segment_before_pullback(
@@ -2014,176 +2080,152 @@ fn strict_bs_is_panbei_trend_window(bis: &[BI], side: StrictBsSide) -> bool {
     }
 }
 
-fn strict_bs_find_center_divergence(
-    all_bis: &[BI],
-    macd: &MacdSeries,
-    id_to_idx: &HashMap<i32, usize>,
-    params: &StrictBsParams,
-    max_n: usize,
-) -> Option<StrictBs1Anchor> {
-    let mut n = max_n.clamp(5, params.n);
-    if n % 2 == 0 {
-        n -= 1;
-    }
-
-    while n >= 5 {
-        let start_index = all_bis
-            .len()
-            .checked_sub(params.di)?
-            .saturating_add(1)
-            .saturating_sub(n);
-        let bis = get_sub_elements(all_bis, params.di, n);
-        if bis.len() == n {
-            let last = bis.last()?;
-            let side = strict_bs_side_from_direction(last.direction);
-            let Some(segment) =
-                strict_bs_find_adjacent_segment_before_leave(&bis, bis.len() - 1, params.center_n)
-            else {
-                n -= 2;
-                continue;
+/// 判断全局笔下标 `idx` 处的笔是否构成一个"已确认的一买 / 一卖锚点"。
+///
+/// 统一入口：BS1 当前笔、BS2 找前置一买 / 一卖都走这里，保证锚点语义一致。
+/// 中枢用前向构造（`strict_bs_find_adjacent_segment_before_leave`，全局 `c.bi_list`），
+/// 观察窗口取以 `idx` 结尾的最近 `n` 笔。
+/// 趋势末端 / 盘整末端判定：以 `idx` 结尾，尝试 n, n-2, …, 5 多个窗口长度，
+/// 任一长度满足即视为成立。与旧版多 n 搜索语义一致——中枢由全局前向构造固定，
+/// 但"末端形态"允许在更短的观察窗口里成立（例如更早出现的高点不应否定末端背驰）。
+fn strict_bs_trend_end_ok(
+    bis: &[BI],
+    idx: usize,
+    n: usize,
+    side: StrictBsSide,
+    panbei: bool,
+) -> bool {
+    let mut w = n;
+    while w >= 5 {
+        if idx + 1 >= w {
+            let window = &bis[idx + 1 - w..=idx];
+            let ok = if panbei {
+                strict_bs_is_panbei_trend_window(window, side)
+            } else {
+                strict_bs_is_trend_window(window, side)
             };
-            debug_assert_eq!(segment.enter_idx + 1, segment.center_start);
-            debug_assert_eq!(segment.center_end + 1, segment.leave_idx);
-            let center = segment.center;
-            let enter = bis.get(segment.enter_idx)?;
-            if enter.direction != last.direction {
-                n -= 2;
-                continue;
-            }
-            let boundary_ok = match side {
-                StrictBsSide::Buy => {
-                    last.direction == Direction::Down
-                        && last.get_low() < strict_bs_boundary_low(center.zd, params.buffer_bp)
-                        && last.get_low()
-                            <= bis.iter().map(|x| x.get_low()).fold(f64::INFINITY, f64::min)
-                }
-                StrictBsSide::Sell => {
-                    last.direction == Direction::Up
-                        && last.get_high() > strict_bs_boundary_high(center.zg, params.buffer_bp)
-                        && last.get_high()
-                            >= bis
-                                .iter()
-                                .map(|x| x.get_high())
-                                .fold(f64::NEG_INFINITY, f64::max)
-                }
-            };
-            if !boundary_ok {
-                n -= 2;
-                continue;
-            }
-
-            let current_power = strict_bs_power_value(last, macd, id_to_idx, params.macd_metric)?;
-            let reference_power = strict_bs_power_value(enter, macd, id_to_idx, params.macd_metric)?;
-            if strict_bs_has_divergence(
-                current_power,
-                reference_power,
-                params.macd_ratio,
-                params.macd_abs_min,
-            ) {
-                return Some(StrictBs1Anchor {
-                    side,
-                    index: start_index + n - 1,
-                    bi_count: n,
-                    low: last.get_low(),
-                    high: last.get_high(),
-                    divergence: StrictBs1Divergence::Center,
-                });
+            if ok {
+                return true;
             }
         }
-        n -= 2;
+        w = w.saturating_sub(2);
     }
-    None
+    false
 }
 
-fn strict_bs_find_panbei_divergence(
-    all_bis: &[BI],
-    macd: &MacdSeries,
-    id_to_idx: &HashMap<i32, usize>,
-    params: &StrictBsParams,
-    max_n: usize,
-) -> Option<StrictBs1Anchor> {
-    let mut n = max_n.clamp(5, params.n);
-    if n % 2 == 0 {
-        n -= 1;
-    }
-
-    while n >= 5 {
-        let start_index = all_bis
-            .len()
-            .checked_sub(params.di)?
-            .saturating_add(1)
-            .saturating_sub(n);
-        let bis = get_sub_elements(all_bis, params.di, n);
-        if bis.len() == n {
-            let window = &bis[bis.len() - 3..];
-            let first = window.first()?;
-            let middle = window.get(1)?;
-            let last = window.last()?;
-            let side = strict_bs_side_from_direction(last.direction);
-            let pattern_ok = match side {
-                StrictBsSide::Buy => {
-                    first.direction == Direction::Down
-                        && middle.direction == Direction::Up
-                        && last.direction == Direction::Down
-                        && last.get_low()
-                            <= bis.iter().map(|x| x.get_low()).fold(f64::INFINITY, f64::min)
-                }
-                StrictBsSide::Sell => {
-                    first.direction == Direction::Up
-                        && middle.direction == Direction::Down
-                        && last.direction == Direction::Up
-                        && last.get_high()
-                            >= bis
-                                .iter()
-                                .map(|x| x.get_high())
-                                .fold(f64::NEG_INFINITY, f64::max)
-                }
-            };
-            if !pattern_ok {
-                n -= 2;
-                continue;
-            }
-            let current_power = strict_bs_bi_macd_abs_area(last, macd, id_to_idx)?;
-            let reference_power = strict_bs_bi_macd_abs_area(first, macd, id_to_idx)?;
-            if strict_bs_has_divergence(
-                current_power,
-                reference_power,
-                params.macd_ratio,
-                params.macd_abs_min,
-            ) {
-                return Some(StrictBs1Anchor {
-                    side,
-                    index: start_index + n - 1,
-                    bi_count: n,
-                    low: last.get_low(),
-                    high: last.get_high(),
-                    divergence: StrictBs1Divergence::Panbei,
-                });
-            }
-        }
-        n -= 2;
-    }
-    None
-}
-
-fn strict_bs_detect_bs1_anchor_v260617(
+fn strict_bs_anchor_at_index(
     c: &CZSC,
     params: &StrictBsParams,
     macd: &MacdSeries,
     id_to_idx: &HashMap<i32, usize>,
-    max_n: usize,
+    idx: usize,
 ) -> Option<StrictBs1Anchor> {
-    if let Some(anchor) = strict_bs_find_center_divergence(&c.bi_list, macd, id_to_idx, params, max_n) {
-        let bis = get_sub_elements(&c.bi_list, params.di, anchor.bi_count);
-        if bis.len() == anchor.bi_count && strict_bs_is_trend_window(bis, anchor.side) {
-            return Some(anchor);
+    let bis = &c.bi_list;
+    if idx >= bis.len() {
+        return None;
+    }
+    let e = &bis[idx];
+    let side = strict_bs_side_from_direction(e.direction);
+
+    // 观察窗口：以 idx 结尾的最近 n 笔（去包含后的趋势末端 / 盘整末端判定）。
+    let w_start = (idx + 1).saturating_sub(params.n);
+    let window = &bis[w_start..=idx];
+    if window.len() < 5 {
+        return None;
+    }
+
+    let confirmed = match side {
+        StrictBsSide::Buy => strict_bs_is_bottom_confirmed(bis, idx),
+        StrictBsSide::Sell => strict_bs_is_top_confirmed(bis, idx),
+    };
+
+    // 1) 中枢背驰：A + 中枢 + E。E=idx 为离开笔；在 idx 之前尝试不同长度、末笔均紧邻
+    //    idx 的中枢（center = bis[idx-len ..= idx-1]，进入段 A = bis[idx-len-1]），
+    //    比较 E 与 A 的 MACD 力度，命中背驰即成立。
+    //    取最短(最近)中枢优先：A 取离 E 最近的入场趋势笔，与人工读图一致；否则前向最长
+    //    中枢会把更早的大幅下跌笔并入中枢、误把其之前的小笔当作 A，导致漏判（见 ZZRM 用例）。
+    if idx >= 4 {
+        let max_len = params.center_n.min(idx.saturating_sub(1));
+        let mut len = 3usize;
+        while len <= max_len {
+            let center_start = idx - len;
+            if let Some(center) = strict_bs_center_bounds(&bis[center_start..idx]) {
+                let enter = &bis[center_start - 1];
+                let boundary_ok = match side {
+                    StrictBsSide::Buy => {
+                        e.direction == Direction::Down
+                            && e.get_low() < strict_bs_boundary_low(center.zd, params.buffer_bp)
+                    }
+                    StrictBsSide::Sell => {
+                        e.direction == Direction::Up
+                            && e.get_high() > strict_bs_boundary_high(center.zg, params.buffer_bp)
+                    }
+                };
+                if enter.direction == e.direction
+                    && boundary_ok
+                    && strict_bs_trend_end_ok(bis, idx, params.n, side, false)
+                    && confirmed
+                {
+                    if let (Some(cur), Some(refp)) = (
+                        strict_bs_power_value(e, macd, id_to_idx, params.macd_metric),
+                        strict_bs_power_value(enter, macd, id_to_idx, params.macd_metric),
+                    ) {
+                        if strict_bs_has_divergence(
+                            cur,
+                            refp,
+                            params.macd_ratio,
+                            params.macd_abs_min,
+                        ) {
+                            return Some(StrictBs1Anchor {
+                                side,
+                                index: idx,
+                                bi_count: window.len(),
+                                low: e.get_low(),
+                                high: e.get_high(),
+                                divergence: StrictBs1Divergence::Center,
+                            });
+                        }
+                    }
+                }
+            }
+            len += 1;
         }
     }
-    if strict_bs1_allows_panbei(params.bs1_divergence_kind) {
-        if let Some(anchor) = strict_bs_find_panbei_divergence(&c.bi_list, macd, id_to_idx, params, max_n) {
-            let bis = get_sub_elements(&c.bi_list, params.di, anchor.bi_count);
-            if bis.len() == anchor.bi_count && strict_bs_is_panbei_trend_window(bis, anchor.side) {
-                return Some(anchor);
+
+    // 2) 盘整背驰：最近三笔 C-D-E 同向比较，且 CDE 本身没有形成新的有效中枢。
+    if strict_bs1_allows_panbei(params.bs1_divergence_kind) && idx >= 2 {
+        let c_bi = &bis[idx - 2];
+        let d_bi = &bis[idx - 1];
+        let pattern_ok = match side {
+            StrictBsSide::Buy => {
+                c_bi.direction == Direction::Down
+                    && d_bi.direction == Direction::Up
+                    && e.direction == Direction::Down
+            }
+            StrictBsSide::Sell => {
+                c_bi.direction == Direction::Up
+                    && d_bi.direction == Direction::Down
+                    && e.direction == Direction::Up
+            }
+        };
+        if pattern_ok
+            && strict_bs_trend_end_ok(bis, idx, params.n, side, true)
+            && confirmed
+        {
+            if let (Some(cur), Some(refp)) = (
+                strict_bs_bi_macd_abs_area(e, macd, id_to_idx),
+                strict_bs_bi_macd_abs_area(c_bi, macd, id_to_idx),
+            ) {
+                if strict_bs_has_divergence(cur, refp, params.macd_ratio, params.macd_abs_min) {
+                    return Some(StrictBs1Anchor {
+                        side,
+                        index: idx,
+                        bi_count: window.len(),
+                        low: e.get_low(),
+                        high: e.get_high(),
+                        divergence: StrictBs1Divergence::Panbei,
+                    });
+                }
             }
         }
     }
@@ -2209,31 +2251,13 @@ pub fn cxt_bs1_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "任意");
     };
     let id_to_idx = bar_index_map(c);
-    let Some(anchor) = strict_bs_detect_bs1_anchor_v260617(c, &p, macd, &id_to_idx, p.n) else {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "任意");
-    };
-
-    let bis = get_sub_elements(&c.bi_list, p.di, anchor.bi_count);
-    if bis.len() < anchor.bi_count {
+    if c.bi_list.is_empty() || p.di == 0 || p.di > c.bi_list.len() {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "结构不足", "任意");
     }
-    let trend_ok = match anchor.divergence {
-        StrictBs1Divergence::Center => strict_bs_is_trend_window(bis, anchor.side),
-        StrictBs1Divergence::Panbei => strict_bs_is_panbei_trend_window(bis, anchor.side),
+    let last_idx = c.bi_list.len() - p.di;
+    let Some(anchor) = strict_bs_anchor_at_index(c, &p, macd, &id_to_idx, last_idx) else {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "任意");
     };
-    if !trend_ok {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "非趋势末端", "任意");
-    }
-
-    let local_anchor_idx = bis.len() - 1;
-    let confirmed = match anchor.side {
-        StrictBsSide::Buy => strict_bs_is_bottom_confirmed(bis, local_anchor_idx),
-        StrictBsSide::Sell => strict_bs_is_top_confirmed(bis, local_anchor_idx),
-    };
-    if !confirmed {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "未确认", "任意");
-    }
-
     let v1 = match anchor.side {
         StrictBsSide::Buy => "一买",
         StrictBsSide::Sell => "一卖",
@@ -2243,7 +2267,7 @@ pub fn cxt_bs1_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         StrictBs1Divergence::Panbei => "盘整背驰",
     };
     let lifecycle_status =
-        strict_bs_lifecycle_status(c, &bis[local_anchor_idx], p.min_ubi_bars, p.max_ubi_bars);
+        strict_bs_lifecycle_status(c, &c.bi_list[last_idx], p.min_ubi_bars, p.max_ubi_bars);
     make_kline_signal_v3(&k1, &k2, k3, v1, v2, lifecycle_status)
 }
 
@@ -2255,43 +2279,12 @@ fn strict_bs_find_recent_bs1_anchor_before_v260617(
     side: StrictBsSide,
     before_idx: usize,
 ) -> Option<StrictBs1Anchor> {
-    let upper = params.n.min(before_idx + 1);
-    if upper < 5 {
-        return None;
+    let anchor = strict_bs_anchor_at_index(c, params, macd, id_to_idx, before_idx)?;
+    if anchor.side == side {
+        Some(anchor)
+    } else {
+        None
     }
-    let mut n = upper;
-    if n % 2 == 0 {
-        n -= 1;
-    }
-    while n >= 5 {
-        let start = before_idx + 1 - n;
-        let window = &c.bi_list[start..=before_idx];
-        let local_params = StrictBsParams { di: 1, ..*params };
-        if let Some(mut anchor) =
-            strict_bs_find_center_divergence(window, macd, id_to_idx, &local_params, n).or_else(
-                || {
-                    if strict_bs1_allows_panbei(params.bs1_divergence_kind) {
-                        strict_bs_find_panbei_divergence(window, macd, id_to_idx, &local_params, n)
-                    } else {
-                        None
-                    }
-                },
-            )
-        {
-            anchor.index += start;
-            if anchor.side == side && anchor.index == before_idx {
-                let confirmed = match side {
-                    StrictBsSide::Buy => strict_bs_is_bottom_confirmed(&c.bi_list, before_idx),
-                    StrictBsSide::Sell => strict_bs_is_top_confirmed(&c.bi_list, before_idx),
-                };
-                if confirmed {
-                    return Some(anchor);
-                }
-            }
-        }
-        n -= 2;
-    }
-    None
 }
 
 fn strict_bs_find_standard_bs2_anchor_v260617(
@@ -2659,22 +2652,27 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "无背驰", "中枢序列");
     };
     let id_to_idx = bar_index_map(c);
-    let bis = get_sub_elements(&c.bi_list, p.di, p.n.max(7));
-    if bis.len() < 5 {
+    let bis = &c.bi_list;
+    if bis.len() < 5 || p.di == 0 || p.di > bis.len() {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "结构不足", "中枢序列");
     }
-    let Some(segment) = strict_bs_find_recent_segment_before_pullback(&bis, bis.len() - 1, p.center_n) else {
+    // 全局笔序列上定位回踩 / 反抽笔（默认 di=1 即最新完成笔），中枢用前向构造，
+    // 这样已封闭中枢不随新笔重绘，三买 / 三卖参照的 zg / zd 稳定。
+    let pullback_idx = bis.len() - p.di;
+    if pullback_idx < 5 {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "结构不足", "中枢序列");
+    }
+    let Some(segment) = strict_bs_find_recent_segment_before_pullback(bis, pullback_idx, p.center_n)
+    else {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "无中枢", "中枢序列");
     };
-    debug_assert_eq!(segment.enter_idx + 1, segment.center_start);
-    debug_assert_eq!(segment.center_end + 1, segment.leave_idx);
-    if segment.pullback_idx() != bis.len() - 1 {
+    if segment.pullback_idx() != pullback_idx {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "回中枢", "中枢序列");
     }
 
     let center = segment.center;
     let leave = &bis[segment.leave_idx];
-    let pullback = &bis[segment.pullback_idx()];
+    let pullback = &bis[pullback_idx];
     if strict_bs_requires_divergence(p.bs3_divergence_mode) {
         let Some(leave_power) = strict_bs_power_value(leave, macd, &id_to_idx, p.macd_metric)
         else {
@@ -2694,7 +2692,7 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         && leave.get_high() > center.zg
         && pullback.direction == Direction::Down
         && pullback.get_low() > center.zg
-        && strict_bs_is_bottom_confirmed(&bis, segment.pullback_idx())
+        && strict_bs_is_bottom_confirmed(bis, pullback_idx)
     {
         let lifecycle_status =
             strict_bs_lifecycle_status(c, pullback, p.min_ubi_bars, p.max_ubi_bars);
@@ -2704,7 +2702,7 @@ pub fn cxt_bs3_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         && leave.get_low() < center.zd
         && pullback.direction == Direction::Up
         && pullback.get_high() < center.zd
-        && strict_bs_is_top_confirmed(&bis, segment.pullback_idx())
+        && strict_bs_is_top_confirmed(bis, pullback_idx)
     {
         let lifecycle_status =
             strict_bs_lifecycle_status(c, pullback, p.min_ubi_bars, p.max_ubi_bars);
