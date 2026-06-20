@@ -2339,39 +2339,42 @@ fn strict_bs_anchor_is_unbroken(
     }
 }
 
-fn strict_bs_find_prior_standard_bs2_idx(
+/// 在 `[start_idx, retest_idx)` 内寻找"前一个标准二买 / 二卖回试"笔下标。
+/// 买：`bis[idx-1]` 向上、`bis[idx]` 向下、且 `bis[idx].low` 不跌破参照保护价 `ref_price`；卖对称。
+/// 参照价由调用方给定：有有效一买/一卖锚点时用锚点低/高点，无前置时用中枢保护位(dd/gg)。
+fn strict_bs_find_prior_bs2_retest(
     bis: &[BI],
-    anchor: StrictBs1Anchor,
+    side: StrictBsSide,
+    start_idx: usize,
+    ref_price: f64,
     retest_idx: usize,
     buffer_bp: f64,
 ) -> Option<usize> {
-    if retest_idx <= anchor.index + 2 {
+    let lo = start_idx.max(1);
+    if retest_idx <= lo {
         return None;
     }
-    match anchor.side {
-        StrictBsSide::Buy => {
-            for idx in (anchor.index + 2..retest_idx).rev() {
+    for idx in (lo..retest_idx).rev() {
+        match side {
+            StrictBsSide::Buy => {
                 if bis[idx - 1].direction == Direction::Up
                     && bis[idx].direction == Direction::Down
-                    && bis[idx].get_low() >= strict_bs_boundary_low(anchor.low, buffer_bp)
+                    && bis[idx].get_low() >= strict_bs_boundary_low(ref_price, buffer_bp)
                 {
                     return Some(idx);
                 }
             }
-            None
-        }
-        StrictBsSide::Sell => {
-            for idx in (anchor.index + 2..retest_idx).rev() {
+            StrictBsSide::Sell => {
                 if bis[idx - 1].direction == Direction::Down
                     && bis[idx].direction == Direction::Up
-                    && bis[idx].get_high() <= strict_bs_boundary_high(anchor.high, buffer_bp)
+                    && bis[idx].get_high() <= strict_bs_boundary_high(ref_price, buffer_bp)
                 {
                     return Some(idx);
                 }
             }
-            None
         }
     }
+    None
 }
 
 fn strict_bs_bi_retests_center(
@@ -2380,18 +2383,42 @@ fn strict_bs_bi_retests_center(
     center: StrictChanCenter,
     buffer_bp: f64,
 ) -> bool {
+    // 回试笔回到中枢的"竖向区间"即可：买点(下探笔)低点落在 [dd, zg]，卖点(反抽笔)高点落在 [zd, gg]。
+    // 用 dd / gg（中枢全幅）而非 zd / zg（中枢窄区）：类二买的下探常常落在中枢下沿之下、绝对低点之上，
+    // 仍属于"回到该中枢"，不应被窄区否掉。
     match side {
         StrictBsSide::Buy => {
             bi.direction == Direction::Down
-                && bi.get_low() >= strict_bs_boundary_low(center.zd, buffer_bp)
+                && bi.get_low() >= strict_bs_boundary_low(center.dd, buffer_bp)
                 && bi.get_low() <= strict_bs_boundary_high(center.zg, buffer_bp)
         }
         StrictBsSide::Sell => {
             bi.direction == Direction::Up
-                && bi.get_high() <= strict_bs_boundary_high(center.zg, buffer_bp)
+                && bi.get_high() <= strict_bs_boundary_high(center.gg, buffer_bp)
                 && bi.get_high() >= strict_bs_boundary_low(center.zd, buffer_bp)
         }
     }
+}
+
+/// 返回 `[start, end)` 内的极值笔下标：买取最低 low，卖取最高 high。用于无前置时
+/// 定位"本段震荡的底/顶"所在笔，作为"首次回试 vs 二次回试"的分界。
+fn strict_bs_extreme_idx(bis: &[BI], side: StrictBsSide, start: usize, end: usize) -> usize {
+    let mut best = start;
+    for k in start..end.min(bis.len()) {
+        match side {
+            StrictBsSide::Buy => {
+                if bis[k].get_low() < bis[best].get_low() {
+                    best = k;
+                }
+            }
+            StrictBsSide::Sell => {
+                if bis[k].get_high() > bis[best].get_high() {
+                    best = k;
+                }
+            }
+        }
+    }
+    best
 }
 
 fn strict_bs_has_third_bs_between(
@@ -2475,16 +2502,16 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let lifecycle_status =
         strict_bs_lifecycle_status(c, retest, p.min_ubi_bars, p.max_ubi_bars);
 
+    // 仅用方向形态确定买卖方向：买=下-上-下，卖=上-下-上。是否"守住低/高点"放到下一步用
+    // 中枢保护价判断，而不是绑死"紧邻前一笔低点"——否则类二买逐次下探略低于上一次就被否。
     let bs2_side = if anchor_bi.direction == Direction::Down
         && middle.direction == Direction::Up
         && retest.direction == Direction::Down
-        && retest.get_low() >= strict_bs_boundary_low(anchor_bi.get_low(), p.buffer_bp)
     {
         Some(StrictBsSide::Buy)
     } else if anchor_bi.direction == Direction::Up
         && middle.direction == Direction::Down
         && retest.direction == Direction::Up
-        && retest.get_high() <= strict_bs_boundary_high(anchor_bi.get_high(), p.buffer_bp)
     {
         Some(StrictBsSide::Sell)
     } else {
@@ -2493,6 +2520,31 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     let Some(side) = bs2_side else {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "结构不符");
     };
+
+    // 本段震荡的最近中枢；保护价取中枢全幅底/顶(dd/gg)，无中枢时退化为紧邻前一笔低/高点。
+    let segment_opt = strict_bs_find_recent_segment_before_pullback(
+        &c.bi_list[..=retest_idx],
+        retest_idx,
+        p.center_n,
+    );
+    let protect_price = match side {
+        StrictBsSide::Buy => segment_opt
+            .map(|s| s.center.dd)
+            .unwrap_or_else(|| anchor_bi.get_low()),
+        StrictBsSide::Sell => segment_opt
+            .map(|s| s.center.gg)
+            .unwrap_or_else(|| anchor_bi.get_high()),
+    };
+    // 回试必须守住保护价（买不破 dd、卖不破 gg）；跌破即视为破坏本段震荡结构。
+    let hold_ok = match side {
+        StrictBsSide::Buy => retest.get_low() >= strict_bs_boundary_low(protect_price, p.buffer_bp),
+        StrictBsSide::Sell => {
+            retest.get_high() <= strict_bs_boundary_high(protect_price, p.buffer_bp)
+        }
+    };
+    if !hold_ok {
+        return make_kline_signal_v3(&k1, &k2, k3, "其他", "任意", "结构不符");
+    }
 
     let divergence_required = strict_bs_requires_divergence(p.bs2_divergence_mode);
     let diverged = match (
@@ -2532,74 +2584,88 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
         }
     }
 
+    // ---- 非标准二买：在"二买 / 类二买" × "有 / 无一买前置"四象限里分类 ----
+    // 关键修正：只认"未被后续新低跌破 / 新高突破"的有效一买 / 一卖锚点。被跌破的旧锚点
+    // 不再算有效前置，也不再直接判 其他_前置失效_破位，而是按"无一买前置"处理——
+    // 二买 / 类二买的下-上-下形态仍成立，只是前面那个低点没满足一买（背驰失败或已被新低跌破）。
     let like_anchor_start = retest_idx.saturating_sub(p.bs2_like_anchor_n);
-    let anchor_before = (like_anchor_start..retest_idx).rev().find_map(|idx| {
+    let valid_anchor = (like_anchor_start..retest_idx).rev().find_map(|idx| {
         strict_bs_find_recent_bs1_anchor_before_v260617(c, &p, macd, &id_to_idx, side, idx)
+            .filter(|a| strict_bs_anchor_is_unbroken(&c.bi_list, *a, retest_idx, p.buffer_bp))
     });
-    let Some(anchor) = anchor_before else {
-        return match side {
-            StrictBsSide::Buy => make_kline_signal_v3(
-                &k1,
-                &k2,
-                k3,
-                "二买",
-                "无一买前置",
-                lifecycle_status,
-            ),
-            StrictBsSide::Sell => make_kline_signal_v3(
-                &k1,
-                &k2,
-                k3,
-                "二卖",
-                "无一卖前置",
-                lifecycle_status,
-            ),
-        };
+
+    let v2_label = match (side, valid_anchor.is_some()) {
+        (StrictBsSide::Buy, true) => "有一买前置",
+        (StrictBsSide::Buy, false) => "无一买前置",
+        (StrictBsSide::Sell, true) => "有一卖前置",
+        (StrictBsSide::Sell, false) => "无一卖前置",
     };
-    if !strict_bs_anchor_is_unbroken(&c.bi_list, anchor, retest_idx, p.buffer_bp) {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "前置失效", "破位");
-    }
-    let Some(prior_bs2_idx) =
-        strict_bs_find_prior_standard_bs2_idx(&c.bi_list, anchor, retest_idx, p.buffer_bp)
-    else {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "非首次回试", "未成类二");
+    let v1_second = match side {
+        StrictBsSide::Buy => "二买",
+        StrictBsSide::Sell => "二卖",
     };
-    if strict_bs_has_third_bs_between(
+    let v1_like = match side {
+        StrictBsSide::Buy => "类二买",
+        StrictBsSide::Sell => "类二卖",
+    };
+
+    // 参照保护价 + "前一个标准回试"搜索起点：
+    //   有前置 -> 用一买 / 一卖锚点低 / 高点，从锚点之后开始搜；
+    //   无前置 -> 用本段中枢保护价(dd / gg)，从"震荡底 / 顶所在笔之后"开始搜——
+    //            这样首次回试不会把震荡起始低点本身误当成"前一个二买"（否则首次二买会被错分成类二）。
+    let (ref_price, prior_search_start) = match valid_anchor {
+        Some(a) => (
+            match side {
+                StrictBsSide::Buy => a.low,
+                StrictBsSide::Sell => a.high,
+            },
+            a.index + 2,
+        ),
+        None => {
+            let start = match segment_opt {
+                Some(seg) => {
+                    strict_bs_extreme_idx(&c.bi_list, side, seg.center_start, retest_idx) + 2
+                }
+                None => like_anchor_start,
+            };
+            (protect_price, start)
+        }
+    };
+
+    // 没有"前一个标准回试" => 首次回试 => 二买 / 二卖（有 / 无前置由 v2_label 决定）。
+    let Some(prior_bs2_idx) = strict_bs_find_prior_bs2_retest(
         &c.bi_list,
         side,
-        prior_bs2_idx,
+        prior_search_start,
+        ref_price,
         retest_idx,
-        p.center_n,
-    ) {
+        p.buffer_bp,
+    ) else {
+        return make_kline_signal_v3(&k1, &k2, k3, v1_second, v2_label, lifecycle_status);
+    };
+
+    // 前一个标准回试到现在之间出现过三买 / 三卖 => 中枢上移，未成类二。
+    if strict_bs_has_third_bs_between(&c.bi_list, side, prior_bs2_idx, retest_idx, p.center_n) {
         return make_kline_signal_v3(&k1, &k2, k3, "其他", "中枢上移", "未成类二");
     }
 
-    let Some(segment) =
-        strict_bs_find_recent_segment_before_pullback(&c.bi_list[..=retest_idx], retest_idx, p.center_n)
-    else {
-        return make_kline_signal_v3(&k1, &k2, k3, "其他", "无中枢", "未成类二");
+    // 二次回试需要有效中枢做"同中枢"判断；没有则退化为首次回试语义。
+    let Some(segment) = segment_opt else {
+        return make_kline_signal_v3(&k1, &k2, k3, v1_second, v2_label, lifecycle_status);
     };
-    debug_assert_eq!(segment.center_end + 1, segment.leave_idx);
-    debug_assert_eq!(segment.leave_idx + 1, retest_idx);
     let center = segment.center;
     let prior_retests_same_center =
         strict_bs_bi_retests_center(&c.bi_list[prior_bs2_idx], side, center, p.buffer_bp);
     let current_retests_center = strict_bs_bi_retests_center(retest, side, center, p.buffer_bp);
+    // 类二买：当前回试与前一个标准回试都回到同一中枢区间即可（已在顶部 hold_ok 校验过守住保护价）。
+    // 不再要求 retest.high <= 中枢 gg —— 探低笔从中枢上沿之上回落属正常，不应否掉。
     match side {
         StrictBsSide::Buy => {
-            if retest.get_low() >= strict_bs_boundary_low(anchor.low, p.buffer_bp)
+            if retest.get_low() >= strict_bs_boundary_low(ref_price, p.buffer_bp)
                 && current_retests_center
                 && prior_retests_same_center
-                && retest.get_high() <= center.gg
             {
-                make_kline_signal_v3(
-                    &k1,
-                    &k2,
-                    k3,
-                    "类二买",
-                    "有一买前置",
-                    lifecycle_status,
-                )
+                make_kline_signal_v3(&k1, &k2, k3, v1_like, v2_label, lifecycle_status)
             } else if retest.get_low() > strict_bs_boundary_high(center.zg, p.buffer_bp)
                 || !prior_retests_same_center
             {
@@ -2609,19 +2675,11 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
             }
         }
         StrictBsSide::Sell => {
-            if retest.get_high() <= strict_bs_boundary_high(anchor.high, p.buffer_bp)
+            if retest.get_high() <= strict_bs_boundary_high(ref_price, p.buffer_bp)
                 && current_retests_center
                 && prior_retests_same_center
-                && retest.get_low() >= center.dd
             {
-                make_kline_signal_v3(
-                    &k1,
-                    &k2,
-                    k3,
-                    "类二卖",
-                    "有一卖前置",
-                    lifecycle_status,
-                )
+                make_kline_signal_v3(&k1, &k2, k3, v1_like, v2_label, lifecycle_status)
             } else if retest.get_high() < strict_bs_boundary_low(center.zd, p.buffer_bp)
                 || !prior_retests_same_center
             {
