@@ -2585,17 +2585,13 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
     }
 
     // ---- 非标准二买：在"二买 / 类二买" × "有 / 无一买前置"四象限里分类 ----
-    // 只认当前震荡段内、且未被后续新低跌破 / 新高突破的有效一买 / 一卖锚点。被跌破或属于更早
-    // 震荡段的旧锚点不再算有效前置，也不再直接判 其他_前置失效_破位，而是按"无一买前置"处理。
-    // 这样类二必须和前一个二买 / 二卖处于同一中枢区间，避免远古一买 / 一卖把首次回试误标成类二。
+    // 关键修正：只认"未被后续新低跌破 / 新高突破"的有效一买 / 一卖锚点。被跌破的旧锚点
+    // 不再算有效前置，也不再直接判 其他_前置失效_破位，而是按"无一买前置"处理——
+    // 二买 / 类二买的下-上-下形态仍成立，只是前面那个低点没满足一买（背驰失败或已被新低跌破）。
     let like_anchor_start = retest_idx.saturating_sub(p.bs2_like_anchor_n);
-    let segment_anchor_start = segment_opt.map(|seg| seg.enter_idx);
-    let valid_anchor = segment_anchor_start.and_then(|segment_start| {
-        let anchor_search_start = like_anchor_start.max(segment_start);
-        (anchor_search_start..retest_idx).rev().find_map(|idx| {
-            strict_bs_find_recent_bs1_anchor_before_v260617(c, &p, macd, &id_to_idx, side, idx)
-                .filter(|a| strict_bs_anchor_is_unbroken(&c.bi_list, *a, retest_idx, p.buffer_bp))
-        })
+    let valid_anchor = (like_anchor_start..retest_idx).rev().find_map(|idx| {
+        strict_bs_find_recent_bs1_anchor_before_v260617(c, &p, macd, &id_to_idx, side, idx)
+            .filter(|a| strict_bs_anchor_is_unbroken(&c.bi_list, *a, retest_idx, p.buffer_bp))
     });
 
     let v2_label = match (side, valid_anchor.is_some()) {
@@ -2623,9 +2619,7 @@ pub fn cxt_bs2_yi_v260617(c: &CZSC, params: &ParamView, cache: &mut TaCache) -> 
                 StrictBsSide::Buy => a.low,
                 StrictBsSide::Sell => a.high,
             },
-            segment_anchor_start
-                .map(|segment_start| (a.index + 2).max(segment_start))
-                .unwrap_or(a.index + 2),
+            a.index + 2,
         ),
         None => {
             let start = match segment_opt {
